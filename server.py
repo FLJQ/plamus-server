@@ -41,6 +41,41 @@ def download():
 def health():
     return jsonify({'status': 'ok'})
 
+import requests
+
+YOUTUBE_API_KEY = 'AIzaSyBddO94_haO-8ZTCWUQ8ATR3mN38_rz3HY'
+
+@app.route('/search', methods=['GET'])
+def search():
+    query = request.args.get('q', '').strip()
+    if not query:
+        return jsonify({'error': 'Query is required'}), 400
+    
+    try:
+        resp = requests.get(
+            'https://www.googleapis.com/youtube/v3/search',
+            params={
+                'part': 'snippet',
+                'q': query,
+                'type': 'video',
+                'maxResults': 10,
+                'key': YOUTUBE_API_KEY,
+            }
+        )
+        data = resp.json()
+        results = []
+        for item in data.get('items', []):
+            results.append({
+                'id': item['id']['videoId'],
+                'title': item['snippet']['title'],
+                'channel': item['snippet']['channelTitle'],
+                'thumbnail': item['snippet']['thumbnails']['medium']['url'],
+                'url': f"https://www.youtube.com/watch?v={item['id']['videoId']}",
+            })
+        return jsonify({'results': results})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=True)
