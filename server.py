@@ -65,12 +65,17 @@ def search():
         data = resp.json()
         results = []
         for item in data.get('items', []):
+            if item.get('id', {}).get('kind') != 'youtube#video':
+                continue
+            video_id = item['id'].get('videoId')
+            if not video_id:
+                continue
             results.append({
-                'id': item['id']['videoId'],
+                'id': video_id,
                 'title': item['snippet']['title'],
                 'channel': item['snippet']['channelTitle'],
                 'thumbnail': item['snippet']['thumbnails']['medium']['url'],
-                'url': f"https://www.youtube.com/watch?v={item['id']['videoId']}",
+                'url': f"https://www.youtube.com/watch?v={video_id}",
             })
         return jsonify({'results': results})
     except Exception as e:
