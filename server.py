@@ -6,32 +6,55 @@ import tempfile
 import traceback
 import requests
 import isodate
- 
+
 app = Flask(__name__)
- 
+
 CLIENTS = ['MWEB', 'WEB_EMBEDDED', 'WEB_CREATOR', 'IOS', 'ANDROID_VR']
-YOUTUBE_API_KEY = 'AIzaSyBddO94_haO-8ZTCWUQ8ATR3mN38_rz3HY'
- 
- 
+
+# ← вставь сюда свои ключи
+API_KEYS = [
+    'AIzaSyBddO94_haO-8ZTCWUQ8ATR3mN38_rz3HY',
+    'AIzaSyAjgN1O-09ffAIj9MtFlKfeBHBkWGz133Q',
+    'AIzaSyD93Er0K0NTGmO1B9mAxI5z98qLL3tLoFY',
+]
+
+_key_index = 0
+
+def get_key():
+    return API_KEYS[_key_index % len(API_KEYS)]
+
+def youtube_get(url, params, retry=True):
+    """GET к YouTube API с автоматической ротацией ключа при исчерпании квоты."""
+    global _key_index
+    params['key'] = get_key()
+    resp = requests.get(url, params=params)
+    data = resp.json()
+    if retry and 'error' in data:
+        for err in data['error'].get('errors', []):
+            if err.get('reason') in ('quotaExceeded', 'dailyLimitExceeded'):
+                _key_index += 1
+                if _key_index % len(API_KEYS) == 0:
+                    # все ключи исчерпаны
+                    return data
+                params['key'] = get_key()
+                resp = requests.get(url, params=params)
+                return resp.json()
+    return data
+
+
 # ──────────────────────────────────────────────────────────
 #  HELPERS
 # ──────────────────────────────────────────────────────────
- 
+
 def fetch_video_details(video_ids):
-    """Batch-fetch duration for up to 50 video IDs.
-    Returns dict { videoId -> duration_seconds }"""
     if not video_ids:
         return {}
-    resp = requests.get(
+    data = youtube_get(
         'https://www.googleapis.com/youtube/v3/videos',
-        params={
-            'part': 'contentDetails',
-            'id': ','.join(video_ids),
-            'key': YOUTUBE_API_KEY,
-        }
+        {'part': 'contentDetails', 'id': ','.join(video_ids)}
     )
     result = {}
-    for item in resp.json().get('items', []):
+    for item in data.get('items', []):
         vid_id = item['id']
         duration_iso = item.get('contentDetails', {}).get('duration', 'PT0S')
         try:
@@ -40,11 +63,9 @@ def fetch_video_details(video_ids):
             seconds = 0
         result[vid_id] = seconds
     return result
- 
- 
+
+
 def fetch_playlist_items(playlist_id):
-    """Fetch all video items from a playlist, handles pagination.
-    Returns list of { id, title, channel, thumbnail, url }"""
     items = []
     page_token = None
     while True:
@@ -52,15 +73,13 @@ def fetch_playlist_items(playlist_id):
             'part': 'snippet',
             'playlistId': playlist_id,
             'maxResults': 50,
-            'key': YOUTUBE_API_KEY,
         }
         if page_token:
             params['pageToken'] = page_token
-        resp = requests.get(
+        data = youtube_get(
             'https://www.googleapis.com/youtube/v3/playlistItems',
-            params=params
+            params
         )
-        data = resp.json()
         for item in data.get('items', []):
             snippet = item.get('snippet', {})
             resource = snippet.get('resourceId', {})
@@ -85,25 +104,24 @@ def fetch_playlist_items(playlist_id):
         if not page_token:
             break
     return items
- 
- 
+
+
 # ──────────────────────────────────────────────────────────
 #  ENDPOINTS
 # ──────────────────────────────────────────────────────────
- 
+
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'})
- 
- 
+    return jsonify({'status': 'ok', 'active_key_index': _key_index % len(API_KEYS)})
+
+
 @app.route('/download', methods=['POST'])
 def download():
-    """Download a single YouTube video as audio."""
     data = request.json
     url = data.get('url', '').strip()
     if not url:
         return jsonify({'error': 'URL is required'}), 400
- 
+
     last_error = None
     for client in CLIENTS:
         try:
@@ -111,12 +129,9 @@ def download():
             yt = YouTube(url, client=client, use_po_token=False)
             stream = yt.streams.filter(only_audio=True).order_by('abr').last()
             if not stream:
-                print(f"No stream for {client}, trying next...")
                 continue
-            print(f"Got stream with {client}!")
             tmpdir = tempfile.mkdtemp()
             out_path = stream.download(output_path=tmpdir)
-            print(f"Done: {out_path}")
             title = yt.title or 'Unknown'
             artist = yt.author or ''
             response = send_file(out_path, as_attachment=True, download_name=os.path.basename(out_path))
@@ -127,53 +142,33 @@ def download():
             print(f"Client {client} failed: {e}")
             last_error = str(e)
             continue
- 
+
     return jsonify({'error': last_error or 'All clients failed'}), 500
- 
- 
+
+
 @app.route('/search', methods=['GET'])
 def search():
-    """Search YouTube for videos + playlists with duration."""
     query = request.args.get('q', '').strip()
     if not query:
         return jsonify({'error': 'Query is required'}), 400
- 
+
     try:
-        # 1. Search videos
-        video_resp = requests.get(
+        video_data = youtube_get(
             'https://www.googleapis.com/youtube/v3/search',
-            params={
-                'part': 'snippet',
-                'q': query,
-                'type': 'video',
-                'maxResults': 8,
-                'key': YOUTUBE_API_KEY,
-            }
+            {'part': 'snippet', 'q': query, 'type': 'video', 'maxResults': 8}
         )
-        video_data = video_resp.json()
- 
-        # 2. Search playlists
-        playlist_resp = requests.get(
+        playlist_data = youtube_get(
             'https://www.googleapis.com/youtube/v3/search',
-            params={
-                'part': 'snippet',
-                'q': query,
-                'type': 'playlist',
-                'maxResults': 3,
-                'key': YOUTUBE_API_KEY,
-            }
+            {'part': 'snippet', 'q': query, 'type': 'playlist', 'maxResults': 3}
         )
-        playlist_data = playlist_resp.json()
- 
-        # 3. Batch-fetch video durations
+
         video_ids = [
             item['id']['videoId']
             for item in video_data.get('items', [])
             if item.get('id', {}).get('videoId')
         ]
         duration_map = fetch_video_details(video_ids)
- 
-        # 4. Fetch playlist track counts
+
         playlist_ids = [
             item['id']['playlistId']
             for item in playlist_data.get('items', [])
@@ -181,20 +176,15 @@ def search():
         ]
         playlist_details = {}
         if playlist_ids:
-            pl_resp = requests.get(
+            pl_data = youtube_get(
                 'https://www.googleapis.com/youtube/v3/playlists',
-                params={
-                    'part': 'contentDetails',
-                    'id': ','.join(playlist_ids),
-                    'key': YOUTUBE_API_KEY,
-                }
+                {'part': 'contentDetails', 'id': ','.join(playlist_ids)}
             )
-            for item in pl_resp.json().get('items', []):
+            for item in pl_data.get('items', []):
                 playlist_details[item['id']] = item.get('contentDetails', {}).get('itemCount', 0)
- 
-        # 5. Build results
+
         results = []
- 
+
         for item in video_data.get('items', []):
             if item.get('id', {}).get('kind') != 'youtube#video':
                 continue
@@ -213,7 +203,7 @@ def search():
                 'url': f'https://www.youtube.com/watch?v={video_id}',
                 'duration_seconds': duration_map.get(video_id, 0),
             })
- 
+
         for item in playlist_data.get('items', []):
             if item.get('id', {}).get('kind') != 'youtube#playlist':
                 continue
@@ -232,69 +222,54 @@ def search():
                 'url': f'https://www.youtube.com/playlist?list={pl_id}',
                 'track_count': playlist_details.get(pl_id, 0),
             })
- 
+
         return jsonify({'results': results})
- 
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
- 
- 
+
+
 @app.route('/playlist', methods=['GET'])
 def playlist_info():
-    """
-    GET /playlist?id=<playlistId>
-    GET /playlist?url=<playlist_url>
- 
-    Returns playlist metadata + all tracks with duration.
-    Client downloads each track individually via /download.
-    """
     playlist_id = request.args.get('id', '').strip()
     url = request.args.get('url', '').strip()
- 
+
     if not playlist_id and url:
         parsed = urlparse(url)
         playlist_id = parse_qs(parsed.query).get('list', [None])[0]
- 
+
     if not playlist_id:
         return jsonify({'error': 'Playlist ID or URL is required'}), 400
- 
+
     try:
-        # 1. Playlist header
-        pl_resp = requests.get(
+        pl_data = youtube_get(
             'https://www.googleapis.com/youtube/v3/playlists',
-            params={
-                'part': 'snippet,contentDetails',
-                'id': playlist_id,
-                'key': YOUTUBE_API_KEY,
-            }
+            {'part': 'snippet,contentDetails', 'id': playlist_id}
         )
-        pl_items = pl_resp.json().get('items', [])
+        pl_items = pl_data.get('items', [])
         if not pl_items:
             return jsonify({'error': 'Playlist not found'}), 404
- 
+
         pl_snippet = pl_items[0]['snippet']
         pl_count = pl_items[0].get('contentDetails', {}).get('itemCount', 0)
         thumbnails = pl_snippet.get('thumbnails', {})
         pl_thumb = thumbnails.get('medium', {}).get('url') or thumbnails.get('default', {}).get('url') or ''
- 
-        # 2. All tracks
+
         tracks_raw = fetch_playlist_items(playlist_id)
- 
-        # 3. Batch-fetch durations (50 per request)
+
         all_durations = {}
         ids = [t['id'] for t in tracks_raw]
         for i in range(0, len(ids), 50):
             all_durations.update(fetch_video_details(ids[i:i + 50]))
- 
-        # 4. Assemble
+
         tracks = []
         total_duration = 0
         for t in tracks_raw:
             dur = all_durations.get(t['id'], 0)
             total_duration += dur
             tracks.append({**t, 'duration_seconds': dur})
- 
+
         return jsonify({
             'id': playlist_id,
             'title': pl_snippet.get('title', ''),
@@ -305,12 +280,12 @@ def playlist_info():
             'total_duration_seconds': total_duration,
             'tracks': tracks,
         })
- 
+
     except Exception as e:
         traceback.print_exc()
         return jsonify({'error': str(e)}), 500
- 
- 
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=True)
