@@ -1,17 +1,16 @@
 from flask import Flask, request, jsonify, send_file
-from pytubefix import YouTube
 from urllib.parse import urlparse, parse_qs, quote
 import os
 import tempfile
 import traceback
 import requests
 import isodate
+import subprocess
+import json
+import glob
 
 app = Flask(__name__)
 
-CLIENTS = ['MWEB', 'WEB_EMBEDDED', 'WEB_CREATOR', 'IOS', 'ANDROID_VR']
-
-# ← вставь сюда свои ключи
 API_KEYS = [
     'AIzaSyBddO94_haO-8ZTCWUQ8ATR3mN38_rz3HY',
     'AIzaSyAjgN1O-09ffAIj9MtFlKfeBHBkWGz133Q',
@@ -24,7 +23,6 @@ def get_key():
     return API_KEYS[_key_index % len(API_KEYS)]
 
 def youtube_get(url, params, retry=True):
-    """GET к YouTube API с автоматической ротацией ключа при исчерпании квоты."""
     global _key_index
     params['key'] = get_key()
     resp = requests.get(url, params=params)
@@ -34,17 +32,12 @@ def youtube_get(url, params, retry=True):
             if err.get('reason') in ('quotaExceeded', 'dailyLimitExceeded'):
                 _key_index += 1
                 if _key_index % len(API_KEYS) == 0:
-                    # все ключи исчерпаны
                     return data
                 params['key'] = get_key()
                 resp = requests.get(url, params=params)
                 return resp.json()
     return data
 
-
-# ──────────────────────────────────────────────────────────
-#  HELPERS
-# ──────────────────────────────────────────────────────────
 
 def fetch_video_details(video_ids):
     if not video_ids:
@@ -106,10 +99,6 @@ def fetch_playlist_items(playlist_id):
     return items
 
 
-# ──────────────────────────────────────────────────────────
-#  ENDPOINTS
-# ──────────────────────────────────────────────────────────
-
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok', 'active_key_index': _key_index % len(API_KEYS)})
@@ -122,28 +111,48 @@ def download():
     if not url:
         return jsonify({'error': 'URL is required'}), 400
 
-    last_error = None
-    for client in CLIENTS:
-        try:
-            print(f"Trying client: {client}")
-            yt = YouTube(url, client=client, use_po_token=False)
-            stream = yt.streams.filter(only_audio=True).order_by('abr').last()
-            if not stream:
-                continue
-            tmpdir = tempfile.mkdtemp()
-            out_path = stream.download(output_path=tmpdir)
-            title = yt.title or 'Unknown'
-            artist = yt.author or ''
-            response = send_file(out_path, as_attachment=True, download_name=os.path.basename(out_path))
-            response.headers['X-Track-Title'] = quote(title)
-            response.headers['X-Track-Artist'] = quote(artist)
-            return response
-        except Exception as e:
-            print(f"Client {client} failed: {e}")
-            last_error = str(e)
-            continue
+    try:
+        tmpdir = tempfile.mkdtemp()
 
-    return jsonify({'error': last_error or 'All clients failed'}), 500
+        # получаем метаданные
+        info_result = subprocess.run(
+            ['yt-dlp', '--no-playlist', '-J', '--no-warnings', url],
+            capture_output=True, text=True, timeout=60
+        )
+        if info_result.returncode != 0:
+            return jsonify({'error': info_result.stderr.strip()}), 500
+
+        info = json.loads(info_result.stdout)
+        title = info.get('title', 'Unknown')
+        artist = info.get('uploader') or info.get('channel') or info.get('creator', '')
+
+        # скачиваем аудио
+        subprocess.run([
+            'yt-dlp', '--no-playlist', '--no-warnings',
+            '-x', '--audio-format', 'm4a', '--audio-quality', '0',
+            '-o', os.path.join(tmpdir, '%(title)s.%(ext)s'),
+            url
+        ], check=True, timeout=300)
+
+        files = glob.glob(os.path.join(tmpdir, '*'))
+        if not files:
+            return jsonify({'error': 'Download produced no file'}), 500
+
+        out_path = files[0]
+        response = send_file(
+            out_path,
+            as_attachment=True,
+            download_name=os.path.basename(out_path)
+        )
+        response.headers['X-Track-Title'] = quote(title)
+        response.headers['X-Track-Artist'] = quote(artist)
+        return response
+
+    except subprocess.CalledProcessError as e:
+        return jsonify({'error': f'yt-dlp error: {e.stderr}'}), 500
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({'error': str(e)}), 500
 
 
 @app.route('/search', methods=['GET'])
